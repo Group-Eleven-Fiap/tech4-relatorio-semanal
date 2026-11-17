@@ -29,6 +29,14 @@ Erro na execução ──► Alarme CloudWatch ──► SNS ──► e-mail
 | CloudWatch + X-Ray | Logs, métricas, alarmes, dashboard e rastreamento. |
 | AWS SAM + GitHub Actions | Infraestrutura como código e deploy automatizado. |
 
+Este repositório faz parte de uma solução com três serviços, implantados nesta ordem:
+
+| Ordem | Repositório | Responsabilidade |
+|-------|-------------|------------------|
+| 1 | [tech4-notificacao-urgencia](https://github.com/Group-Eleven-Fiap/tech4-notificacao-urgencia) | Criar a fila e enviar o e-mail de aviso quando a avaliação é crítica. |
+| 2 | [tech4-ingestao-avaliacao](https://github.com/Group-Eleven-Fiap/tech4-ingestao-avaliacao) | Receber, validar, classificar e gravar a avaliação (cria a tabela). |
+| 3 | **tech4-relatorio-semanal** (este) | Enviar o relatório semanal com média e quantidades. |
+
 ## Documentação da função
 
 **Responsabilidade única:** transformar as avaliações da semana em um e-mail de relatório. Não recebe avaliações, não calcula urgência e não altera a tabela.
@@ -104,7 +112,7 @@ Este repositório não cria a tabela: ela pertence à ingestão, que deve ser im
 | `ADMIN_EMAIL` | Destinatário do relatório. | Sim |
 | `EMAIL_REMETENTE` | Remetente, verificado no SES. | Sim |
 | `TABELA_AVALIACOES` | Nome da tabela. Padrão: `Avaliacoes`. | Não |
-| `AWS_ENDPOINT_URL` | Endpoint alternativo, usado com o LocalStack. | Não |
+| `AWS_ENDPOINT_URL` | Endpoint alternativo para testes locais. Não é definido na AWS. | Não |
 
 ## Segurança e governança
 
@@ -145,8 +153,10 @@ sam deploy --stack-name tech4-relatorio-semanal --region us-east-1 --resolve-s3 
 Disparo manual, sem esperar a segunda-feira:
 
 ```powershell
-aws lambda invoke --function-name relatorio-semanal --region us-east-1 saida.json
+aws lambda invoke --function-name relatorio-semanal --region us-east-1 --cli-binary-format raw-in-base64-out --payload '{}' saida.json
 ```
+
+O e-mail chega ao administrador e o log `/aws/lambda/relatorio-semanal` registra `relatorio.sucesso`. Como o período é sempre os 7 dias anteriores à execução, o disparo manual gera o mesmo tipo de relatório do agendamento.
 
 ## Build e testes
 
@@ -154,18 +164,29 @@ Pré-requisito: JDK 21.
 
 ```powershell
 .\mvnw.cmd test
+.\mvnw.cmd package
 ```
 
-### Execução local
+São 12 testes unitários: leitura da tabela (inclusive todas as páginas do `Scan` e itens inválidos), média e quantidades por dia e por urgência, período de 7 dias, dia no horário de Brasília, relatório sem avaliações, envio pelo SES e falhas. Nenhum deles acessa a AWS. Eles rodam no pipeline antes de cada deploy.
+
+## Verificação após o deploy
 
 ```powershell
-docker compose -f docker/docker-compose.yml up -d
-docker compose -f docker/docker-compose.yml exec localstack awslocal ses verify-email-identity --email-address remetente@exemplo.com
-docker compose -f docker/docker-compose.yml exec localstack awslocal dynamodb create-table --table-name Avaliacoes --attribute-definitions AttributeName=id,AttributeType=S --key-schema AttributeName=id,KeyType=HASH --billing-mode PAY_PER_REQUEST
+aws cloudformation describe-stacks --stack-name tech4-relatorio-semanal --region us-east-1 --query "Stacks[0].StackStatus"
+aws scheduler get-schedule --name relatorio-semanal-agendamento --region us-east-1 --query "[ScheduleExpression,ScheduleExpressionTimezone,State]"
+aws logs tail /aws/lambda/relatorio-semanal --region us-east-1 --since 15m
+```
 
-$env:AWS_ENDPOINT_URL = "http://localhost:4566"
+O agendamento deve estar `ENABLED`, com `cron(0 8 ? * MON *)` e `America/Sao_Paulo`. Para ver um relatório sem esperar a segunda-feira, use o disparo manual da seção *Deploy*.
+
+## Execução local
+
+O `LocalRunner` chama o handler sem implantar nada. Ele usa a AWS de verdade: **lê a tabela `Avaliacoes` (somente leitura) e envia um e-mail real pelo SES**. Para isso, é preciso ter credenciais da AWS na máquina (por exemplo, `aws login`) com permissão de `dynamodb:Scan` nessa tabela e de envio pelo SES, a tabela já criada pela ingestão e os dois endereços verificados no SES, em `us-east-1`:
+
+```powershell
+$env:AWS_REGION = "us-east-1"
 $env:EMAIL_REMETENTE = "remetente@exemplo.com"
 $env:ADMIN_EMAIL = "admin@exemplo.com"
 ```
 
-Depois, execute `relatorio_semanal.LocalRunner` pela IDE. O e-mail gerado pode ser consultado em `http://localhost:4566/_aws/ses`. Com a tabela vazia, o relatório sai com o aviso de que não houve avaliações.
+Depois, execute `relatorio_semanal.LocalRunner` pela IDE. Com a tabela vazia, o relatório sai com o aviso de que não houve avaliações.
